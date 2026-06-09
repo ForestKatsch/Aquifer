@@ -1,4 +1,5 @@
 import Observation
+import SwiftUI
 
 /// Drives a single query's ``QueryState`` for a view. Errors are caught here, on the main actor, so
 /// `any Error` never crosses an isolation boundary.
@@ -10,6 +11,7 @@ final class QueryObserver<Q: Query> {
     @ObservationIgnored private var query: Q?
     @ObservationIgnored private var client: QueryClient?
     @ObservationIgnored private var subscription: Task<Void, Never>?
+    @ObservationIgnored private var lastScenePhase: ScenePhase?
 
     init() {}
 
@@ -38,6 +40,12 @@ final class QueryObserver<Q: Query> {
             await client.endEvents(id)
             await client.release(key)
         }
+    }
+
+    func handleScenePhase(_ phase: ScenePhase) {
+        defer { lastScenePhase = phase }
+        guard let last = lastScenePhase, last != .active, phase == .active else { return }
+        refetchIfStale()
     }
 
     func refetchIfStale() {

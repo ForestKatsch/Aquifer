@@ -64,16 +64,21 @@ struct QueryState<Value: Sendable> {
 
 ## Read several at once
 
-Resolve as a unit. Loading if any is loading, failed if any fails, done when all succeed.
+Resolve as a unit with `MultiQueryView`. Loading if any is loading, failed if any fails, done when
+all succeed.
 
 ```swift
-QueryView(UserByID(id: 1), PostsByUser(id: 1)) { user, posts in
+MultiQueryView(UserByID(id: 1), PostsByUser(id: 1)) { user, posts in
     ProfileHeader(user)
     PostList(posts)
 } error: { error in
     ErrorView(error)
 }
 ```
+
+`@FetchMultiple` is the property-wrapper form. Single queries should use `QueryView` / `@Fetch`
+above — they're not just simpler but avoid the `each Q` parameter pack these multi-query types rely
+on, which can crash the Swift runtime while building view metadata on current toolchains.
 
 ## Infinite queries
 

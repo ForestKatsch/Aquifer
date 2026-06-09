@@ -1,21 +1,30 @@
 import SwiftUI
 
-/// Renders one of three states, in priority order: **done** if there's a value, else **error**,
-/// else **loading**. With several queries the content closure takes one argument per query and runs
-/// only when all succeed. `loading` defaults to a `ProgressView`.
-public struct QueryView<each Q: Query, Content: View, ErrorContent: View, Loading: View>: View {
-    private var fetch: Fetch<repeat each Q>
-    private let content: (repeat (each Q).Value) -> Content
+/// Renders a query in one of three states, in priority order: **done** if there's a value, else
+/// **error**, else **loading**. `loading` defaults to a `ProgressView`.
+///
+/// ```swift
+/// QueryView(TodoByID(id: 5)) { todo in
+///     Text(todo.title)
+/// } error: { error in
+///     ErrorView(error)
+/// }
+/// ```
+///
+/// For several queries resolved as one unit, use ``MultiQueryView``.
+public struct QueryView<Q: Query, Content: View, ErrorContent: View, Loading: View>: View {
+    private var fetch: Fetch<Q>
+    private let content: (Q.Value) -> Content
     private let errorContent: (Error) -> ErrorContent
     private let loading: () -> Loading
 
     public init(
-        _ queries: repeat each Q,
-        @ViewBuilder content: @escaping (repeat (each Q).Value) -> Content,
+        _ query: Q,
+        @ViewBuilder content: @escaping (Q.Value) -> Content,
         @ViewBuilder error: @escaping (Error) -> ErrorContent,
         @ViewBuilder loading: @escaping () -> Loading
     ) {
-        self.fetch = Fetch(repeat each queries)
+        self.fetch = Fetch(query)
         self.content = content
         self.errorContent = error
         self.loading = loading
@@ -24,7 +33,7 @@ public struct QueryView<each Q: Query, Content: View, ErrorContent: View, Loadin
     public var body: some View {
         let state = fetch.wrappedValue
         if let value = state.value {
-            content(repeat each value)
+            content(value)
         } else if let error = state.error {
             errorContent(error)
         } else {
@@ -35,10 +44,10 @@ public struct QueryView<each Q: Query, Content: View, ErrorContent: View, Loadin
 
 public extension QueryView where Loading == ProgressView<EmptyView, EmptyView> {
     init(
-        _ queries: repeat each Q,
-        @ViewBuilder content: @escaping (repeat (each Q).Value) -> Content,
+        _ query: Q,
+        @ViewBuilder content: @escaping (Q.Value) -> Content,
         @ViewBuilder error: @escaping (Error) -> ErrorContent
     ) {
-        self.init(repeat each queries, content: content, error: error, loading: { ProgressView() })
+        self.init(query, content: content, error: error, loading: { ProgressView() })
     }
 }
