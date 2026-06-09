@@ -7,4 +7,9 @@ struct CacheKey: Hashable, Sendable {
         self.typeID = ObjectIdentifier(Q.self)
         self.value = AnyHashableSendable(query)
     }
+
+    init<Q: InfiniteQuery>(_ query: Q) {
+        self.typeID = ObjectIdentifier(Q.self)
+        self.value = AnyHashableSendable(query)
+    }
 }

@@ -75,6 +75,71 @@ QueryView(UserByID(id: 1), PostsByUser(id: 1)) { user, posts in
 }
 ```
 
+## Infinite queries
+
+For paginated lists. An `InfiniteQuery` accumulates pages in one cache entry — its identity is the
+query *without* a cursor, and cursors are threaded through `fetch(page:)` as pages load.
+
+```swift
+struct Feed: InfiniteQuery {
+    var initialPageParam: String? { nil }            // first request carries no cursor
+
+    func fetch(page cursor: String?) async throws -> FeedPage {
+        try await api.get("/feed", cursor: cursor)
+    }
+
+    func nextPageParam(after last: FeedPage, pages: [FeedPage], params: [String?]) -> String?? {
+        guard let next = last.nextCursor else { return nil }   // nil ⇒ no more pages
+        return next
+    }
+}
+```
+
+The cursor type (`PageParam`) is yours. Make it optional, like `String?`, when the first request has
+no cursor — `initialPageParam` supplies the first value, `nextPageParam` returns the next or `nil` to
+stop. (With an optional cursor, return `nil` explicitly to stop rather than `return last.nextCursor`,
+so "no more pages" stays distinct from "next page has a nil cursor.") Implement `previousPageParam`
+too for chat-style "load older" lists; it defaults to `nil` (forward-only).
+
+### Drive it from a view
+
+`@InfiniteFetch` gives you a handle: the accumulated `pages`, paging flags, and the page-stepping
+actions. Loading the first page is automatic.
+
+```swift
+struct FeedList: View {
+    @InfiniteFetch(Feed()) private var feed
+
+    var body: some View {
+        List {
+            ForEach(feed.pages.flatMap(\.items)) { item in FeedRow(item) }
+            if feed.hasNextPage {
+                ProgressView().task { await feed.fetchNextPage() }
+            }
+        }
+    }
+}
+```
+
+`fetchNextPage()` is idempotent — a no-op when there's no next page or one is already loading — so
+it's safe to call straight from `.onAppear` / `.task` on the last row.
+
+### Or let `InfiniteQueryView` do it
+
+It owns the `List`, flattens each page into rows, and paginates as you scroll. `loading` and the
+next-page `footer` spinner are defaulted.
+
+```swift
+InfiniteQueryView(Feed()) { page in page.items } row: { item in
+    FeedRow(item)
+} error: { error in
+    ErrorView(error)
+}
+```
+
+Infinite entries cache, go stale, and invalidate like any query. On invalidation an on-screen
+infinite query refetches **every loaded page** in order, so the list stays consistent.
+
 ## The cache
 
 A `QueryClient` actor holds the cache, dedupes requests, and runs stale-while-revalidate. Create one and inject it at the root.
