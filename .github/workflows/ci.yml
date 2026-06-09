@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    # macos-26 ships Xcode 26 (Swift 6.2), which the package requires for isolated
+    # conformances and pack iteration. macos-15 has no Xcode 26 and would not compile.
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Swift version
+        run: swift --version
+
+      # Swift 5 language mode with complete concurrency checking (the package default).
+      # warnings-as-errors makes any concurrency regression fail the build.
+      - name: Build (Swift 5 mode, strict concurrency)
+        run: swift build -Xswiftc -warnings-as-errors
+      - name: Test (Swift 5 mode)
+        run: swift test -Xswiftc -warnings-as-errors
+
+      # Same package, Swift 6 language mode. Guards against anything that only passes
+      # under the looser Swift 5 rules.
+      - name: Build (Swift 6 language mode)
+        run: swift build -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
+      - name: Test (Swift 6 language mode)
+        run: swift test -Xswiftc -swift-version -Xswiftc 6 -Xswiftc -warnings-as-errors
