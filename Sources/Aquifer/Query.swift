@@ -11,9 +11,17 @@ public protocol Query: Hashable, Sendable {
 
   /// How long an unused value is kept after its last observer leaves. `nil` uses the client's.
   var gcTime: Duration? { get }
+
+  /// How many attempts this query gets before resting in a terminal error. `nil` uses the client's.
+  var retry: Int? { get }
+
+  /// Base delay before the first retry; backs off exponentially. `nil` uses the client's.
+  var retryDelay: Duration? { get }
 }
 
 extension Query {
   public var staleTime: Duration? { nil }
   public var gcTime: Duration? { nil }
+  public var retry: Int? { nil }
+  public var retryDelay: Duration? { nil }
 }

@@ -15,6 +15,15 @@ import SwiftUI
 /// }
 /// ```
 ///
+/// The `$`-projection of ``Fetch``: imperative actions on the query.
+@MainActor
+public struct FetchActions<Q: Query> {
+    let observer: QueryObserver<Q>
+
+    /// Force a fresh fetch, clearing any terminal error — pull-to-refresh, a Retry button.
+    public func refetch() { observer.refetch() }
+}
+
 /// For the uncommon case of several queries resolved as one unit, use ``FetchMultiple``.
 @MainActor
 @propertyWrapper
@@ -30,6 +39,11 @@ public struct Fetch<Q: Query>: @MainActor DynamicProperty {
 
     public var wrappedValue: QueryState<Q.Value> {
         observer.state
+    }
+
+    /// Actions on the query, via the `$`-projection: `$todo.refetch()` for pull-to-refresh / Retry.
+    public var projectedValue: FetchActions<Q> {
+        FetchActions(observer: observer)
     }
 
     public func update() {
