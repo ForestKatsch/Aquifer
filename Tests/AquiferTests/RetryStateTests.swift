@@ -157,3 +157,39 @@ struct RetryStateTests {
 private struct Cancels: Query {
     func fetch() async throws -> Int { throw CancellationError() }
 }
+
+/// `id == 1` always fails (and schedules a backoff retry); other ids succeed. Used to check that
+/// switching an observer to a new query cancels the old query's pending retry.
+private struct Switchable: Query {
+    let id: Int
+    @MainActor static var attempts: [Int: Int] = [:]
+    var retry: Int? { 5 }
+    var retryDelay: Duration? { .milliseconds(50) }
+
+    func fetch() async throws -> Int {
+        await MainActor.run { Switchable.attempts[id, default: 0] += 1 }
+        if id == 1 { throw Boom() }
+        return id * 10
+    }
+}
+
+@MainActor
+@Suite("Observer retry lifecycle", .serialized)
+struct ObserverRetryTests {
+    @Test("switching the observer's query cancels the old query's pending retry")
+    func switchCancelsRetry() async throws {
+        Switchable.attempts = [:]
+        let client = QueryClient()
+        let observer = QueryObserver<Switchable>()
+
+        observer.start(Switchable(id: 1), client: client)
+        try await Task.sleep(for: .milliseconds(20))     // id 1 fails once, schedules a ~50ms retry
+        #expect(Switchable.attempts[1] == 1)
+
+        observer.start(Switchable(id: 2), client: client)   // switch before the retry fires
+        try await Task.sleep(for: .milliseconds(150))       // well past id 1's backoff
+
+        #expect(Switchable.attempts[1] == 1)   // old retry was cancelled — no second attempt
+        #expect(observer.state.value == 20)    // state reflects the new query
+    }
+}

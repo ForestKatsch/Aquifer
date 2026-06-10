@@ -23,6 +23,8 @@ final class QueryObserver<Q: Query> {
         self.query = query
         self.client = client
         subscription?.cancel()
+        retryTask?.cancel()   // a pending backoff retry belongs to the old query; drop it
+        retryTask = nil
 
         let key = CacheKey(query)
         subscription = Task { [weak self] in
