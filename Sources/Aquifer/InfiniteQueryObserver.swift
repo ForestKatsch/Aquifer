@@ -67,11 +67,14 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
     /// Manually force a fresh load of the pages — pull-to-refresh, a Retry button. Clears any
     /// terminal error.
     func refetch() {
+        Task { [weak self] in await self?.refetch() }
+    }
+
+    /// Awaitable form: completes when the load settles, so a `.refreshable` spinner can track it.
+    func refetch() async {
         guard let query, let client else { return }
-        Task { [weak self] in
-            await client.markForRetry(for: query)
-            await self?.load(query, from: client)
-        }
+        await client.markForRetry(for: query)
+        await load(query, from: client)
     }
 
     /// Load the first page, or refetch all loaded pages if they've gone stale. Sticky pages stay on

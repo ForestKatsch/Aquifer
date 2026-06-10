@@ -19,8 +19,12 @@ public struct InfiniteQueryHandle<Q: InfiniteQuery> {
     public func fetchNextPage() async { await observer.fetchNextPage() }
     public func fetchPreviousPage() async { await observer.fetchPreviousPage() }
 
-    /// Force a fresh load of the pages, clearing any terminal error — pull-to-refresh, a Retry button.
+    /// Force a fresh load of the pages, clearing any terminal error — a Retry button.
     public func refetch() { observer.refetch() }
+
+    /// Awaitable form for `.refreshable { await listing.refetch() }`: the spinner stays until the
+    /// load actually finishes.
+    public func refetch() async { await observer.refetch() }
 }
 
 /// Reads an ``InfiniteQuery`` into a view as an observable ``InfiniteQueryHandle``. The first page

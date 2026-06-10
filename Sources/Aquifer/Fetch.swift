@@ -20,8 +20,12 @@ import SwiftUI
 public struct FetchActions<Q: Query> {
     let observer: QueryObserver<Q>
 
-    /// Force a fresh fetch, clearing any terminal error — pull-to-refresh, a Retry button.
+    /// Force a fresh fetch, clearing any terminal error — a Retry button.
     public func refetch() { observer.refetch() }
+
+    /// Awaitable form for `.refreshable { await $todo.refetch() }`: the spinner stays until the
+    /// fetch actually finishes.
+    public func refetch() async { await observer.refetch() }
 }
 
 /// For the uncommon case of several queries resolved as one unit, use ``FetchMultiple``.

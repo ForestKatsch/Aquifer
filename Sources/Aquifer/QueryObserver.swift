@@ -67,11 +67,14 @@ final class QueryObserver<Q: Query> {
 
     /// Manually force a fresh fetch — pull-to-refresh, a Retry button. Clears any terminal error.
     func refetch() {
+        Task { [weak self] in await self?.refetch() }
+    }
+
+    /// Awaitable form: completes when the load settles, so a `.refreshable` spinner can track it.
+    func refetch() async {
         guard let query, let client else { return }
-        Task { [weak self] in
-            await client.markForRetry(for: query)
-            await self?.load(query, from: client)
-        }
+        await client.markForRetry(for: query)
+        await load(query, from: client)
     }
 
     private func load(_ query: Q, from client: QueryClient) async {
