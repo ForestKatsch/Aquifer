@@ -49,6 +49,22 @@ struct QueryClientTests {
         #expect(cached.isStale == true)
     }
 
+    @Test("forceStaleKeepingValue keeps the value and forces the next fetch")
+    func forceStaleKeepsValue() async throws {
+        // Backs an explicit refetch(): even a fresh, successful entry must refetch ("no matter
+        // what") while keeping its value on screen ("don't delete the data").
+        let client = QueryClient(options: QueryOptions(staleTime: .seconds(1000)))
+        _ = try await client.fetch(Counter(id: 7))
+        #expect(await client.cachedValue(for: Counter(id: 7)).isStale == false)
+
+        await client.forceStaleKeepingValue(for: Counter(id: 7))
+
+        let cached = await client.cachedValue(for: Counter(id: 7))
+        #expect(cached.value == 70) // value kept (stale-while-revalidate)
+        #expect(cached.isStale == true) // and forced stale…
+        #expect(await client.shouldFetch(for: Counter(id: 7)) == true) // …so the next load refetches
+    }
+
     @Test("remove drops the value entirely")
     func remove() async throws {
         let client = QueryClient()

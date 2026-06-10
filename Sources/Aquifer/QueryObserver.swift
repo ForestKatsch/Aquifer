@@ -71,9 +71,11 @@ final class QueryObserver<Q: Query> {
     }
 
     /// Awaitable form: completes when the load settles, so a `.refreshable` spinner can track it.
+    /// Invalidate (keeping the value) without notifying, then run a single awaited load — so the
+    /// spinner tracks exactly this fetch instead of a notify-spawned concurrent one.
     func refetch() async {
         guard let query, let client else { return }
-        await client.markForRetry(for: query)
+        await client.forceStaleKeepingValue(for: query)
         await load(query, from: client)
     }
 

@@ -112,18 +112,30 @@ public actor QueryClient {
         if let error = entries[key]?.error { throw error }
     }
 
-    /// Reset an entry's failure state and mark it stale, so the next ``shouldFetch`` says yes. The
-    /// recovery path out of a terminal error: invalidate, refetch, and foreground all route here.
+    /// Reset an entry's failure state and mark it stale, so the next ``shouldFetch`` says yes, then
+    /// `notify` so observers reload. For recovery triggers that don't await a load themselves —
+    /// returning to the foreground out of a terminal error.
     func markForRetry<Q: Query>(for query: Q) { markForRetry(key: CacheKey(query)) }
     func markForRetry<Q: InfiniteQuery>(for query: Q) { markForRetry(key: CacheKey(query)) }
     private func markForRetry(key: CacheKey) {
+        forceStaleKeepingValue(key: key)
+        notify(key)
+    }
+
+    /// Mark the entry stale and clear its failure gate, **keeping** the cached value
+    /// (stale-while-revalidate). Unlike ``markForRetry``, this does **not** `notify`: it's for an
+    /// explicit `refetch()` that immediately awaits its own `load()`. Notifying here would wake
+    /// observers — including the caller — into a second, concurrent load; mid-`.refreshable` that
+    /// extra load mutates state and tears the spinner down before the awaited load finishes.
+    func forceStaleKeepingValue<Q: Query>(for query: Q) { forceStaleKeepingValue(key: CacheKey(query)) }
+    func forceStaleKeepingValue<Q: InfiniteQuery>(for query: Q) { forceStaleKeepingValue(key: CacheKey(query)) }
+    private func forceStaleKeepingValue(key: CacheKey) {
         guard var entry = entries[key] else { return }
         entry.failedAt = nil
         entry.failureCount = 0
         entry.error = nil
         entry.forcedStale = true
         entries[key] = entry
-        notify(key)
     }
 
     /// Record a failed attempt on the entry, preserving any last-good value (stale-while-revalidate).
