@@ -18,6 +18,9 @@ public struct InfiniteQueryHandle<Q: InfiniteQuery> {
 
     public func fetchNextPage() async { await observer.fetchNextPage() }
     public func fetchPreviousPage() async { await observer.fetchPreviousPage() }
+
+    /// Force a fresh load of the pages, clearing any terminal error — pull-to-refresh, a Retry button.
+    public func refetch() { observer.refetch() }
 }
 
 /// Reads an ``InfiniteQuery`` into a view as an observable ``InfiniteQueryHandle``. The first page

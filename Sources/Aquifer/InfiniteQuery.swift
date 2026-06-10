@@ -30,12 +30,20 @@ public protocol InfiniteQuery: Hashable, Sendable {
 
     /// How long the entry is kept after its last observer leaves. `nil` uses the client's.
     var gcTime: Duration? { get }
+
+    /// How many attempts a page load gets before resting in a terminal error. `nil` uses the client's.
+    var retry: Int? { get }
+
+    /// Base delay before the first retry; backs off exponentially. `nil` uses the client's.
+    var retryDelay: Duration? { get }
 }
 
 extension InfiniteQuery {
     public func previousPageParam(before first: Page, pages: [Page], params: [PageParam]) -> PageParam? { nil }
     public var staleTime: Duration? { nil }
     public var gcTime: Duration? { nil }
+    public var retry: Int? { nil }
+    public var retryDelay: Duration? { nil }
 }
 
 /// The accumulated pages of an ``InfiniteQuery`` plus the cursor each was fetched with. `pages` and

@@ -17,11 +17,20 @@ public actor QueryClient {
     /// Holds either a ``Query`` or an ``InfiniteQuery``. `query` is the concrete struct (kept for
     /// type/predicate matching in invalidate/remove); `staleTime`/`gcTime` are resolved from it at
     /// store time so the lifecycle code never has to cast back through an existential.
+    ///
+    /// An entry records *both* outcomes. `value`/`updatedAt` are the last **success** and stay sticky
+    /// across a later failure (stale-while-revalidate). `failedAt`/`failureCount`/`error` track the
+    /// last **failure**; `failedAt == nil` means the most recent attempt succeeded. An entry can
+    /// therefore exist with no value at all — a key that has only ever failed — which is what lets
+    /// "never fetched" and "fetched and failed" be different states.
     private struct Entry {
         var query: any Sendable
-        var value: any Sendable
-        var updatedAt: ContinuousClock.Instant
+        var value: (any Sendable)?
+        var updatedAt: ContinuousClock.Instant?
         var forcedStale: Bool
+        var failedAt: ContinuousClock.Instant?
+        var failureCount: Int
+        var error: (any Error)?
         var staleTime: Duration?
         var gcTime: Duration?
     }
@@ -46,19 +55,89 @@ public actor QueryClient {
 
     // MARK: - Reading
 
-    /// Cached value plus staleness, without fetching.
+    /// Cached value plus staleness and failure summary, without fetching. The `Error` itself is not
+    /// returned (it isn't `Sendable`); read it with ``surfaceError(for:)``.
     func cachedValue<Q: Query>(for query: Q) -> CachedValue<Q.Value> {
         let key = CacheKey(query)
         guard let entry = entries[key] else {
             return CachedValue(value: nil, isStale: true)
         }
-        let value = entry.value as? Q.Value
-        return CachedValue(value: value, isStale: isStale(entry))
+        return CachedValue(
+            value: entry.value as? Q.Value,
+            isStale: isStale(entry),
+            failureCount: entry.failureCount,
+            isError: entry.failedAt != nil
+        )
     }
 
     private func isStale(_ entry: Entry) -> Bool {
+        guard let updatedAt = entry.updatedAt else { return true }   // never succeeded
         let staleTime = entry.staleTime ?? options.staleTime
-        return entry.forcedStale || (clock.now - entry.updatedAt) >= staleTime
+        return entry.forcedStale || (clock.now - updatedAt) >= staleTime
+    }
+
+    // MARK: - Fetch eligibility & failure state
+
+    /// Whether a fetch should run *now*. The fix for the failed-fetch storm: a key that has only ever
+    /// failed is no longer treated as "cold" — during backoff and after the retry cap this returns
+    /// `false`, so a change notification re-reads state without kicking off another doomed request.
+    func shouldFetch<Q: Query>(for query: Q) -> Bool {
+        shouldFetch(key: CacheKey(query), retry: query.retry, retryDelay: query.retryDelay)
+    }
+
+    func shouldFetch<Q: InfiniteQuery>(for query: Q) -> Bool {
+        shouldFetch(key: CacheKey(query), retry: query.retry, retryDelay: query.retryDelay)
+    }
+
+    private func shouldFetch(key: CacheKey, retry: Int?, retryDelay: Duration?) -> Bool {
+        guard let entry = entries[key] else { return true }   // cold: never attempted
+        if let failedAt = entry.failedAt {                    // last attempt failed
+            guard entry.failureCount < (retry ?? options.retry) else { return false }   // exhausted
+            let delay = RetryPolicy.backoff(
+                failureCount: entry.failureCount,
+                base: retryDelay ?? options.retryDelay,
+                cap: options.maxRetryDelay
+            )
+            return (clock.now - failedAt) >= delay   // only after backoff
+        }
+        return entry.value == nil || isStale(entry)   // last attempt succeeded → normal SWR
+    }
+
+    /// Throw the entry's recorded error, if its last attempt failed. Lets an observer that *didn't*
+    /// run the failing fetch still surface the error, without crossing a non-`Sendable` value out as
+    /// a return — `throws` is the one channel an `any Error` may use.
+    func surfaceError<Q: Query>(for query: Q) throws { try surfaceError(key: CacheKey(query)) }
+    func surfaceError<Q: InfiniteQuery>(for query: Q) throws { try surfaceError(key: CacheKey(query)) }
+    private func surfaceError(key: CacheKey) throws {
+        if let error = entries[key]?.error { throw error }
+    }
+
+    /// Reset an entry's failure state and mark it stale, so the next ``shouldFetch`` says yes. The
+    /// recovery path out of a terminal error: invalidate, refetch, and foreground all route here.
+    func markForRetry<Q: Query>(for query: Q) { markForRetry(key: CacheKey(query)) }
+    func markForRetry<Q: InfiniteQuery>(for query: Q) { markForRetry(key: CacheKey(query)) }
+    private func markForRetry(key: CacheKey) {
+        guard var entry = entries[key] else { return }
+        entry.failedAt = nil
+        entry.failureCount = 0
+        entry.error = nil
+        entry.forcedStale = true
+        entries[key] = entry
+        notify(key)
+    }
+
+    /// Record a failed attempt on the entry, preserving any last-good value (stale-while-revalidate).
+    /// Creates a value-less entry if the key has never succeeded. Cancellation is *not* a failure.
+    private func recordFailure(_ key: CacheKey, query: any Sendable, error: any Error, staleTime: Duration?, gcTime: Duration?) {
+        if error is CancellationError { return }
+        var entry = entries[key] ?? Entry(
+            query: query, value: nil, updatedAt: nil, forcedStale: false,
+            failedAt: nil, failureCount: 0, error: nil, staleTime: staleTime, gcTime: gcTime
+        )
+        entry.failedAt = clock.now
+        entry.failureCount += 1
+        entry.error = error
+        entries[key] = entry
     }
 
     // MARK: - Fetching
@@ -82,12 +161,14 @@ public actor QueryClient {
             inFlight[key] = nil
             entries[key] = Entry(
                 query: query, value: value, updatedAt: clock.now, forcedStale: false,
+                failedAt: nil, failureCount: 0, error: nil,
                 staleTime: query.staleTime, gcTime: query.gcTime
             )
             notify(key)
             return value as! Q.Value
         } catch {
             inFlight[key] = nil
+            recordFailure(key, query: query, error: error, staleTime: query.staleTime, gcTime: query.gcTime)
             notify(key)
             throw error
         }
@@ -101,8 +182,12 @@ public actor QueryClient {
         guard let entry = entries[key] else {
             return CachedValue(value: nil, isStale: true)
         }
-        let value = entry.value as? PagedValue<Q.Page, Q.PageParam>
-        return CachedValue(value: value, isStale: isStale(entry))
+        return CachedValue(
+            value: entry.value as? PagedValue<Q.Page, Q.PageParam>,
+            isStale: isStale(entry),
+            failureCount: entry.failureCount,
+            isError: entry.failedAt != nil
+        )
     }
 
     /// Load the first page, or — if pages already exist — refetch every loaded page in order,
@@ -131,7 +216,7 @@ public actor QueryClient {
             }
             return PagedValue(pages: pages, params: params)
         }
-        return try await store(task, key: key, flightKey: flightKey, query: query)
+        return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: true)
     }
 
     /// Append the page after the last one. No-op if there are no pages yet or no next cursor.
@@ -153,7 +238,7 @@ public actor QueryClient {
             let page = try await query.fetch(page: param)
             return PagedValue(pages: base.pages + [page], params: base.params + [param])
         }
-        return try await store(task, key: key, flightKey: flightKey, query: query)
+        return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: false)
     }
 
     /// Prepend the page before the first one. No-op if there are no pages yet or no previous cursor.
@@ -175,12 +260,18 @@ public actor QueryClient {
             let page = try await query.fetch(page: param)
             return PagedValue(pages: [page] + base.pages, params: [param] + base.params)
         }
-        return try await store(task, key: key, flightKey: flightKey, query: query)
+        return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: false)
     }
 
     /// Await a page task, store its result as the entry's value, and clear the in-flight slot.
+    ///
+    /// `recordsFailure` is true only for the initial/refetch direction: that's the notify-driven
+    /// `load` path that could storm. A `fetchNextPage`/`fetchPreviousPage` failure is user-triggered
+    /// (a scroll), so it surfaces its error but must not set the entry's `failedAt` — otherwise it
+    /// would wrongly gate the whole-list load behind backoff.
     private func store<Q: InfiniteQuery>(
-        _ task: Task<any Sendable, Error>, key: CacheKey, flightKey: PageFlightKey, query: Q
+        _ task: Task<any Sendable, Error>, key: CacheKey, flightKey: PageFlightKey, query: Q,
+        recordsFailure: Bool
     ) async throws -> PagedValue<Q.Page, Q.PageParam> {
         pageFlights[flightKey] = task
         do {
@@ -188,13 +279,19 @@ public actor QueryClient {
             pageFlights[flightKey] = nil
             entries[key] = Entry(
                 query: query, value: value, updatedAt: clock.now, forcedStale: false,
+                failedAt: nil, failureCount: 0, error: nil,
                 staleTime: query.staleTime, gcTime: query.gcTime
             )
             notify(key)
             return value as! PagedValue<Q.Page, Q.PageParam>
         } catch {
             pageFlights[flightKey] = nil
-            notify(key)
+            if recordsFailure {
+                // Recorded a load failure: cache state changed, so wake observers to surface it.
+                recordFailure(key, query: query, error: error, staleTime: query.staleTime, gcTime: query.gcTime)
+                notify(key)
+            }
+            // A next/previous-page failure changed nothing cached; the caller surfaces its own error.
             throw error
         }
     }
@@ -273,6 +370,10 @@ public actor QueryClient {
         for key in Array(entries.keys) {
             guard var entry = entries[key], matches(entry.query) else { continue }
             entry.forcedStale = true
+            // Invalidation is also a recovery trigger: clear any failure so a terminal query refetches.
+            entry.failedAt = nil
+            entry.failureCount = 0
+            entry.error = nil
             entries[key] = entry
             notify(key)
         }
@@ -317,4 +418,6 @@ public actor QueryClient {
 struct CachedValue<Value: Sendable>: Sendable {
     var value: Value?
     var isStale: Bool
+    var failureCount: Int = 0
+    var isError: Bool = false
 }

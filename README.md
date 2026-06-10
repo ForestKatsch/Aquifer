@@ -54,13 +54,49 @@ struct TodoDetail: View {
 
 ```swift
 struct QueryState<Value: Sendable> {
-    var value: Value?    // last success, survives a refetch
+    var value: Value?       // last success, survives a refetch
     var error: Error?
     var isFetching: Bool
+    var isError: Bool       // last attempt failed (value, if any, still shown)
+    var failureCount: Int   // consecutive failures since the last success
 }
 ```
 
 `value != nil && isFetching` is the stale-while-revalidate case: old data on screen, new data loading.
+
+## Errors and retries
+
+A failed fetch is a recorded state, not a discarded one. The last good `value` stays sticky and on
+screen; `error`/`isError` describe the failure alongside it.
+
+Failures retry automatically with exponential backoff up to a cap, then the query **rests** in a
+terminal error instead of hammering the server — a re-render never re-fires it. Tune per client or
+per query:
+
+```swift
+QueryOptions(retry: 3, retryDelay: .seconds(1), maxRetryDelay: .seconds(30))
+
+extension TodoByID {
+    var retry: Int? { 5 }   // override for this query
+}
+```
+
+A capped-out query resumes only on an explicit trigger: `invalidate`, `remove`, returning to the
+foreground, or a manual refetch. `@Fetch` exposes that through its projection:
+
+```swift
+struct TodoDetail: View {
+    @Fetch(TodoByID(id: 5)) private var todo
+
+    var body: some View {
+        if todo.isError {
+            Button("Retry") { $todo.refetch() }
+        }
+    }
+}
+```
+
+(`InfiniteQueryHandle` has the same `refetch()`.)
 
 ## Read several at once
 

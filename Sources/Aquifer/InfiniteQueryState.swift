@@ -18,6 +18,12 @@ public struct InfiniteQueryState<Page> {
     /// There is another page before the first one.
     public var hasPreviousPage: Bool
 
+    /// The last attempt failed. Sticky `pages` (if any) are still shown. `error` carries the why.
+    public var isError: Bool
+
+    /// Consecutive failures of the initial/refetch load since the last success.
+    public var failureCount: Int
+
     public init(
         pages: [Page] = [],
         error: Error? = nil,
@@ -25,7 +31,9 @@ public struct InfiniteQueryState<Page> {
         isFetchingNextPage: Bool = false,
         isFetchingPreviousPage: Bool = false,
         hasNextPage: Bool = false,
-        hasPreviousPage: Bool = false
+        hasPreviousPage: Bool = false,
+        isError: Bool = false,
+        failureCount: Int = 0
     ) {
         self.pages = pages
         self.error = error
@@ -34,5 +42,7 @@ public struct InfiniteQueryState<Page> {
         self.isFetchingPreviousPage = isFetchingPreviousPage
         self.hasNextPage = hasNextPage
         self.hasPreviousPage = hasPreviousPage
+        self.isError = isError
+        self.failureCount = failureCount
     }
 }
