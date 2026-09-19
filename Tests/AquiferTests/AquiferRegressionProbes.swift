@@ -113,6 +113,15 @@ func waitUntil(_ timeout: Duration = .milliseconds(800), _ condition: @MainActor
     }
 }
 
+/// Background the scene and come back — the path a resume actually takes.
+@MainActor
+func resume(_ observer: InfiniteQueryObserver<Feed>, settle: Duration = .milliseconds(150)) async {
+    observer.handleScenePhase(.active)
+    observer.handleScenePhase(.background)
+    observer.handleScenePhase(.active)
+    await quiesce(settle)
+}
+
 /// Let the notify / event-stream machinery run to a standstill.
 @MainActor
 func quiesce(_ duration: Duration = .milliseconds(150)) async {
@@ -243,7 +252,7 @@ struct AquiferRegressionProbes {
 
     /// The user is on page 3. A refetch runs and the second page comes back empty (HN hiccup,
     /// rate-limit page, end-of-feed drift).
-    @Test("a short page during a refetch does not truncate the list under the user")
+    @Test("a short page during a background reload does not truncate the list")
     func refetchTruncatesList() async {
         let server = Server()
         let client = QueryClient(options: QueryOptions(staleTime: .milliseconds(30)))
@@ -258,8 +267,7 @@ struct AquiferRegressionProbes {
 
         server.truncateAt = 1   // page 1 now comes back empty
         try? await Task.sleep(for: .milliseconds(50))
-        await observer.refetch()
-        await quiesce()
+        await resume(observer)
 
         let rowsAfter = observer.state.pages.flatMap { $0 }.count
         #expect(rowsAfter >= rowsBefore,
@@ -269,7 +277,7 @@ struct AquiferRegressionProbes {
     }
 
     /// Does a refetch disturb the rows the List is anchored to?
-    @Test("a refetch leaves the anchored row where it was")
+    @Test("a background reload leaves the anchored row where it was")
     func refetchKeepsRowIdentity() async {
         let server = Server()
         let client = QueryClient(options: QueryOptions(staleTime: .milliseconds(30)))
@@ -282,8 +290,7 @@ struct AquiferRegressionProbes {
 
         server.insertAtTop(2)          // two new posts, as HN does constantly
         try? await Task.sleep(for: .milliseconds(50))
-        await o.refetch()
-        await quiesce()
+        await resume(o)
         let after = o.state.pages.flatMap { $0 }
 
         let anchor = before[6]         // the row the user was looking at
@@ -315,7 +322,7 @@ struct AquiferRegressionProbes {
     // MARK: - 4. Races and lifecycle
 
     /// Foreground refetch is in flight; the user scrolls and the last row asks for the next page.
-    @Test("a next-page load concurrent with a refetch is not clobbered")
+    @Test("a next-page load concurrent with a background reload is not clobbered")
     func concurrentNextPageAndRefetch() async {
         let server = Server()
         let client = QueryClient(options: QueryOptions(staleTime: .milliseconds(30)))
@@ -330,10 +337,11 @@ struct AquiferRegressionProbes {
         server.delays = [0: .milliseconds(120), 1: .milliseconds(120)]
         try? await Task.sleep(for: .milliseconds(50))
 
-        async let refetch: Void = observer.refetch()
+        observer.handleScenePhase(.active)
+        observer.handleScenePhase(.background)
+        observer.handleScenePhase(.active)   // kicks the reload off; does not block
         try? await Task.sleep(for: .milliseconds(20))
-        async let next: Void = observer.fetchNextPage()
-        _ = await (refetch, next)
+        await observer.fetchNextPage()       // the reader scrolls mid-reload
         await quiesce(.milliseconds(400))
 
         #expect(observer.state.pages.count == 3,
@@ -374,6 +382,29 @@ struct AquiferRegressionProbes {
         let later = await client.cachedValue(for: query)
         #expect(later.value == nil,
                 "entry still cached (\(String(describing: later.value))) long after gcTime with zero observers")
+    }
+
+    /// Pull-to-refresh is a deliberate "start again from the top": the reader is already at the
+    /// top, and a clean list has no gap where items shifted across the page-one boundary.
+    @Test("an explicit refresh resets the list to the first page")
+    func explicitRefreshResets() async {
+        let server = Server()
+        let client = QueryClient(options: QueryOptions(staleTime: .milliseconds(30)))
+        let o = InfiniteQueryObserver<Feed>()
+        o.start(Feed(server: server.id), client: client)
+        await waitUntil { o.state.pages.count == 1 }
+        await o.fetchNextPage()
+        await o.fetchNextPage()
+        #expect(o.state.pages.count == 3)
+
+        try? await Task.sleep(for: .milliseconds(50))
+        let before = server.requestCount
+        await o.refetch()
+        await quiesce()
+
+        #expect(o.state.pages.count == 1, "pull-to-refresh should reset to one page")
+        #expect(server.requestCount - before == 1, "and cost exactly one request")
+        #expect(o.state.hasNextPage, "with more pages still reachable by scrolling")
     }
 
     // MARK: - 5. Controls that should still hold

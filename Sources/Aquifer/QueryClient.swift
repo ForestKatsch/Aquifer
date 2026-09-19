@@ -239,7 +239,7 @@ public actor QueryClient {
         }
 
         if policy == .firstPage {
-            return try await fetchFirstPage(key: key, flightKey: flightKey, query: query)
+            return try await fetchFirstPage(key: key, flightKey: flightKey, query: query, reset: explicit)
         }
 
         // .allPages: re-thread every cursor from the start. This deliberately replaces the whole
@@ -302,18 +302,24 @@ public actor QueryClient {
         )
     }
 
-    /// Reload page one and splice it into the list in place, leaving the pages after it alone.
+    /// Reload page one.
     ///
-    /// Like ``fetchPage``, the splice happens inside the flight task and reads the entry as it is
+    /// `reset` distinguishes the two callers. A *background* revalidation splices the fresh page in
+    /// where the old one was and leaves the pages below it — and the reader's position — alone. A
+    /// *user-driven* refresh (`reset`) drops the accumulated pages and starts from one: the reader
+    /// is at the top of the list anyway, and a clean list has no gap where items shifted across the
+    /// page-one boundary while they were scrolled in.
+    ///
+    /// Like ``fetchPage``, the commit happens inside the flight task and reads the entry as it is
     /// *then*: a page the reader appended by scrolling while this was in flight must not be undone
     /// by writing back the snapshot this reload started from.
     private func fetchFirstPage<Q: InfiniteQuery>(
-        key: CacheKey, flightKey: PageFlightKey, query: Q
+        key: CacheKey, flightKey: PageFlightKey, query: Q, reset: Bool
     ) async throws -> PagedValue<Q.Page, Q.PageParam> {
         let param = query.initialPageParam
         let task = Task<any Sendable, Error> { [self] in
             let page = try await query.fetch(page: param)
-            return commitFirstPage(page: page, key: key, query: query, param: param)
+            return commitFirstPage(page: page, key: key, query: query, param: param, reset: reset)
         }
         pageFlights[flightKey] = task
         do {
@@ -330,11 +336,11 @@ public actor QueryClient {
     }
 
     private func commitFirstPage<Q: InfiniteQuery>(
-        page: Q.Page, key: CacheKey, query: Q, param: Q.PageParam
+        page: Q.Page, key: CacheKey, query: Q, param: Q.PageParam, reset: Bool
     ) -> PagedValue<Q.Page, Q.PageParam> {
         let current = entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>
         var merged = PagedValue(pages: [page], params: [param])
-        if var pages = current?.pages, var params = current?.params,
+        if !reset, var pages = current?.pages, var params = current?.params,
            pages.count > 1, params.count == pages.count {
             pages[0] = page
             params[0] = param
