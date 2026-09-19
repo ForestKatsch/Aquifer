@@ -137,13 +137,13 @@ struct InfiniteQueryTests {
         _ = try await client.fetchInfinite(Pages())
         _ = try await client.fetchNextPage(Pages())
         _ = try await client.fetchNextPage(Pages())
-        #expect(await Pages.requests == [0, 1, 2])
+        #expect(Pages.requests == [0, 1, 2])
 
         await client.invalidate(Pages.self)
         let value = try await client.fetchInfinite(Pages())
 
         // One request, and the pages the reader scrolled through are still there.
-        #expect(await Pages.requests == [0, 1, 2, 0])
+        #expect(Pages.requests == [0, 1, 2, 0])
         #expect(value.pages.count == 3)
         #expect(value.params == [0, 1, 2])
     }
@@ -153,7 +153,7 @@ struct InfiniteQueryTests {
         let client = QueryClient(options: QueryOptions(staleTime: .seconds(1000)))
         _ = try await client.fetchInfinite(Pages())
         _ = try await client.fetchNextPage(Pages())
-        await Pages.setPrefix("new")
+        Pages.setPrefix("new")
 
         await client.invalidate(Pages.self)
         let value = try await client.fetchInfinite(Pages())
