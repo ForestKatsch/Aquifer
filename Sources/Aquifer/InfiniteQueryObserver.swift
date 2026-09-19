@@ -12,7 +12,10 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
     @ObservationIgnored private var query: Q?
     @ObservationIgnored private var client: QueryClient?
     @ObservationIgnored private var subscription: Task<Void, Never>?
-    @ObservationIgnored private var lastScenePhase: ScenePhase?
+    /// Set the moment the scene actually backgrounds. `.inactive` alone — Control Centre, the app
+    /// switcher, a permission alert, Slide Over — is *not* a background, and must not trigger a
+    /// reload: that was a full refetch every time a notification banner slid down.
+    @ObservationIgnored private var wasBackgrounded = false
     @ObservationIgnored private var retryTask: Task<Void, Never>?
 
     init() {}
@@ -36,7 +39,7 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
 
             for await changed in stream {
                 if changed == key {
-                    await self?.load(query, from: client)
+                    await self?.load(query, from: client, trigger: .notification)
                 }
             }
 
@@ -46,9 +49,12 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
     }
 
     func handleScenePhase(_ phase: ScenePhase) {
-        defer { lastScenePhase = phase }
-        guard let last = lastScenePhase, last != .active, phase == .active else { return }
-        refetchIfStale()
+        if phase == .background {
+            wasBackgrounded = true
+        } else if phase == .active, wasBackgrounded {
+            wasBackgrounded = false
+            refetchIfStale()
+        }
     }
 
     func refetchIfStale() {
@@ -76,15 +82,24 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
     func refetch() async {
         guard let query, let client else { return }
         await client.forceStaleKeepingValue(for: query)
-        await load(query, from: client)
+        await load(query, from: client, trigger: .explicit)
     }
 
     /// Load the first page, or refetch all loaded pages if they've gone stale. Sticky pages stay on
     /// screen meanwhile. Gated by the client's retry policy so a failing load can't storm.
-    private func load(_ query: Q, from client: QueryClient) async {
+    private func load(_ query: Q, from client: QueryClient, trigger: LoadTrigger = .direct) async {
         let cached = await client.cachedPages(for: query)
         apply(cached.value, query: query)
         state.failureCount = cached.failureCount
+
+        // A change notification means the cache moved, and the right response is to re-read it.
+        // Starting a fetch from here as well is what let `staleTime: .zero` spin forever: every
+        // success notifies us, and we are instantly stale again. Only a value that has gone away,
+        // an explicit invalidation, or a retryable failure warrants fetching off a notification;
+        // plain ageing is picked up by mount, foreground and explicit refresh.
+        if trigger == .notification, !(cached.value == nil || cached.forcedStale || cached.isError) {
+            return
+        }
 
         guard await client.shouldFetch(for: query) else {
             await surfaceCachedError(query, from: client)
@@ -94,7 +109,7 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
 
         state.isFetching = true
         do {
-            let value = try await client.fetchInfinite(query)
+            let value = try await client.fetchInfinite(query, explicit: trigger == .explicit)
             apply(value, query: query)
             state.error = nil
             state.isError = false
@@ -191,5 +206,6 @@ final class InfiniteQueryObserver<Q: InfiniteQuery> {
 
     deinit {
         subscription?.cancel()
+        retryTask?.cancel()
     }
 }

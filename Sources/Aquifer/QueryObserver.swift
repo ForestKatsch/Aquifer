@@ -1,6 +1,17 @@
 import Observation
 import SwiftUI
 
+/// Why an observer is reloading. A `.notification` reload re-reads the cache; it only fetches when
+/// the entry genuinely needs it (see `load`).
+enum LoadTrigger {
+    /// Mounting, or returning to the foreground.
+    case direct
+    /// The cache raised a change event for this key.
+    case notification
+    /// The user asked: pull-to-refresh, or a Retry button.
+    case explicit
+}
+
 /// Drives a single query's ``QueryState`` for a view. Errors are caught here, on the main actor, so
 /// `any Error` never crosses an isolation boundary.
 @MainActor
@@ -11,7 +22,10 @@ final class QueryObserver<Q: Query> {
     @ObservationIgnored private var query: Q?
     @ObservationIgnored private var client: QueryClient?
     @ObservationIgnored private var subscription: Task<Void, Never>?
-    @ObservationIgnored private var lastScenePhase: ScenePhase?
+    /// Set the moment the scene actually backgrounds. `.inactive` alone — Control Centre, the app
+    /// switcher, a permission alert, Slide Over — is *not* a background, and must not trigger a
+    /// reload: that was a full refetch every time a notification banner slid down.
+    @ObservationIgnored private var wasBackgrounded = false
     @ObservationIgnored private var retryTask: Task<Void, Never>?
 
     init() {}
@@ -35,7 +49,7 @@ final class QueryObserver<Q: Query> {
 
             for await changed in stream {
                 if changed == key {
-                    await self?.load(query, from: client)
+                    await self?.load(query, from: client, trigger: .notification)
                 }
             }
 
@@ -46,9 +60,12 @@ final class QueryObserver<Q: Query> {
     }
 
     func handleScenePhase(_ phase: ScenePhase) {
-        defer { lastScenePhase = phase }
-        guard let last = lastScenePhase, last != .active, phase == .active else { return }
-        refetchIfStale()
+        if phase == .background {
+            wasBackgrounded = true
+        } else if phase == .active, wasBackgrounded {
+            wasBackgrounded = false
+            refetchIfStale()
+        }
     }
 
     func refetchIfStale() {
@@ -76,13 +93,22 @@ final class QueryObserver<Q: Query> {
     func refetch() async {
         guard let query, let client else { return }
         await client.forceStaleKeepingValue(for: query)
-        await load(query, from: client)
+        await load(query, from: client, trigger: .explicit)
     }
 
-    private func load(_ query: Q, from client: QueryClient) async {
+    private func load(_ query: Q, from client: QueryClient, trigger: LoadTrigger = .direct) async {
         let cached = await client.cachedValue(for: query)
         state.value = cached.value
         state.failureCount = cached.failureCount
+
+        // A change notification means the cache moved, and the right response is to re-read it.
+        // Starting a fetch from here as well is what let `staleTime: .zero` spin forever: every
+        // success notifies us, and we are instantly stale again. Only a value that has gone away,
+        // an explicit invalidation, or a retryable failure warrants fetching off a notification;
+        // plain ageing is picked up by mount, foreground and explicit refresh.
+        if trigger == .notification, !(cached.value == nil || cached.forcedStale || cached.isError) {
+            return
+        }
 
         guard await client.shouldFetch(for: query) else {
             // Not fetching — but a sibling may have recorded an error we should surface.

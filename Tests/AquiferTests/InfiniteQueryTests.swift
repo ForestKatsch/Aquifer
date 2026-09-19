@@ -8,6 +8,9 @@ private struct Numbers: InfiniteQuery {
     @MainActor static var fetchCount = 0
 
     var initialPageParam: Int { 0 }
+    // Opts out of the default first-page-only revalidation so the tests below can assert the
+    // re-thread-every-cursor behaviour.
+    var revalidation: InfiniteRevalidation { .allPages }
 
     func fetch(page param: Int) async throws -> [Int] {
         await MainActor.run { Numbers.fetchCount += 1 }
@@ -42,6 +45,28 @@ private struct Window: InfiniteQuery {
     }
 }
 
+/// Default revalidation policy, with a request log and a mutable page body.
+private struct Pages: InfiniteQuery {
+    @MainActor static var requests: [Int] = []
+    @MainActor private static var prefix = "old"
+
+    @MainActor static func setPrefix(_ p: String) { prefix = p }
+    @MainActor static func reset() { requests = []; prefix = "old" }
+
+    var initialPageParam: Int { 0 }
+
+    func fetch(page param: Int) async throws -> String {
+        await MainActor.run {
+            Pages.requests.append(param)
+            return "\(Pages.prefix)-\(param)"
+        }
+    }
+
+    func nextPageParam(after last: String, pages: [String], params: [Int]) -> Int? {
+        (params.last ?? 0) + 1
+    }
+}
+
 /// A cursor that is `nil` for the first request — the null-first pattern.
 private struct Cursored: InfiniteQuery {
     var initialPageParam: String? { nil }
@@ -60,7 +85,7 @@ private struct Cursored: InfiniteQuery {
 @MainActor
 @Suite("InfiniteQuery", .serialized)
 struct InfiniteQueryTests {
-    init() { Numbers.fetchCount = 0 }
+    init() { Numbers.fetchCount = 0; Pages.reset() }
 
     @Test("initial load fetches just the first page")
     func initialLoad() async throws {
@@ -104,6 +129,36 @@ struct InfiniteQueryTests {
 
         let stopped = try await client.fetchPreviousPage(Window())   // no page before 0
         #expect(stopped.pages == [0, 1, 2])
+    }
+
+    @Test("the default revalidation reloads only the first page")
+    func refetchFirstPageOnly() async throws {
+        let client = QueryClient(options: QueryOptions(staleTime: .seconds(1000)))
+        _ = try await client.fetchInfinite(Pages())
+        _ = try await client.fetchNextPage(Pages())
+        _ = try await client.fetchNextPage(Pages())
+        #expect(await Pages.requests == [0, 1, 2])
+
+        await client.invalidate(Pages.self)
+        let value = try await client.fetchInfinite(Pages())
+
+        // One request, and the pages the reader scrolled through are still there.
+        #expect(await Pages.requests == [0, 1, 2, 0])
+        #expect(value.pages.count == 3)
+        #expect(value.params == [0, 1, 2])
+    }
+
+    @Test("a first-page reload replaces page one in place")
+    func firstPageReloadSplices() async throws {
+        let client = QueryClient(options: QueryOptions(staleTime: .seconds(1000)))
+        _ = try await client.fetchInfinite(Pages())
+        _ = try await client.fetchNextPage(Pages())
+        await Pages.setPrefix("new")
+
+        await client.invalidate(Pages.self)
+        let value = try await client.fetchInfinite(Pages())
+
+        #expect(value.pages == ["new-0", "old-1"])   // page one refreshed, page two untouched
     }
 
     @Test("invalidate refetches every loaded page, in order")

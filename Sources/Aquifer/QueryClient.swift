@@ -66,7 +66,8 @@ public actor QueryClient {
             value: entry.value as? Q.Value,
             isStale: isStale(entry),
             failureCount: entry.failureCount,
-            isError: entry.failedAt != nil
+            isError: entry.failedAt != nil,
+            forcedStale: entry.forcedStale
         )
     }
 
@@ -150,6 +151,7 @@ public actor QueryClient {
         entry.failureCount += 1
         entry.error = error
         entries[key] = entry
+        scheduleGCIfUnobserved(key)
     }
 
     // MARK: - Fetching
@@ -170,16 +172,19 @@ public actor QueryClient {
 
         do {
             let value = try await task.value
-            inFlight[key] = nil
+            // Only clear the slot if it is still *this* task: a `drop` during the flight may have
+            // cleared it and a newer fetch may already own it.
+            if inFlight[key] == task { inFlight[key] = nil }
             entries[key] = Entry(
                 query: query, value: value, updatedAt: clock.now, forcedStale: false,
                 failedAt: nil, failureCount: 0, error: nil,
                 staleTime: query.staleTime, gcTime: query.gcTime
             )
+            scheduleGCIfUnobserved(key)
             notify(key)
             return value as! Q.Value
         } catch {
-            inFlight[key] = nil
+            if inFlight[key] == task { inFlight[key] = nil }
             recordFailure(key, query: query, error: error, staleTime: query.staleTime, gcTime: query.gcTime)
             notify(key)
             throw error
@@ -198,35 +203,59 @@ public actor QueryClient {
             value: entry.value as? PagedValue<Q.Page, Q.PageParam>,
             isStale: isStale(entry),
             failureCount: entry.failureCount,
-            isError: entry.failedAt != nil
+            isError: entry.failedAt != nil,
+            forcedStale: entry.forcedStale
         )
     }
 
-    /// Load the first page, or — if pages already exist — refetch every loaded page in order,
-    /// threading cursors from `initialPageParam` so the list stays consistent even if the backend's
-    /// pagination drifted. One request per key; concurrent callers join it.
+    /// Reload the query's pages according to its ``InfiniteQuery/revalidation`` policy.
+    ///
+    /// The default policy reloads only the first page and leaves the pages after it in place: one
+    /// request, and a reader scrolled ten pages deep keeps their position. ``InfiniteRevalidation/allPages``
+    /// restores the re-thread-everything behaviour. One request per key and direction; concurrent
+    /// callers join it.
+    ///
+    /// `explicit` marks a user-driven reload (pull-to-refresh, a Retry button). It upgrades the
+    /// ``InfiniteRevalidation/none`` policy to ``InfiniteRevalidation/firstPage``, so "don't reload
+    /// in the background" never means "the refresh control does nothing".
     @discardableResult
-    func fetchInfinite<Q: InfiniteQuery>(_ query: Q) async throws -> PagedValue<Q.Page, Q.PageParam> {
+    func fetchInfinite<Q: InfiniteQuery>(_ query: Q, explicit: Bool = false) async throws -> PagedValue<Q.Page, Q.PageParam> {
         let key = CacheKey(query)
         let flightKey = PageFlightKey(key: key, direction: .refetch)
         if let existing = pageFlights[flightKey] {
             return try await existing.value as! PagedValue<Q.Page, Q.PageParam>
         }
 
-        let existingCount = (entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>)?.pages.count ?? 0
-        let pageCount = max(existingCount, 1)
+        let existing = entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>
+        let loaded = existing?.pages.count ?? 0
+
+        var policy = query.revalidation
+        if policy == .none, explicit { policy = .firstPage }
+        // Nothing loaded yet: there is no position to preserve and no cheaper option than page one.
+        if loaded == 0 { policy = .firstPage }
+
+        if policy == .none {
+            return existing ?? PagedValue()
+        }
+
+        if policy == .firstPage {
+            return try await fetchFirstPage(key: key, flightKey: flightKey, query: query)
+        }
+
+        // .allPages: re-thread every cursor from the start. This deliberately replaces the whole
+        // list, so a page appended while it was running is superseded rather than merged.
         let task = Task<any Sendable, Error> {
             var pages: [Q.Page] = []
             var params: [Q.PageParam] = []
             var param: Q.PageParam? = query.initialPageParam
-            for _ in 0..<pageCount {
+            for _ in 0 ..< max(loaded, 1) {
                 guard let p = param else { break }
                 let page = try await query.fetch(page: p)
                 pages.append(page)
                 params.append(p)
                 param = query.nextPageParam(after: page, pages: pages, params: params)
             }
-            return PagedValue(pages: pages, params: params)
+            return query.reconcile(PagedValue(pages: pages, params: params))
         }
         return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: true)
     }
@@ -246,11 +275,10 @@ public actor QueryClient {
             return (entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>) ?? PagedValue()
         }
 
-        let task = Task<any Sendable, Error> {
-            let page = try await query.fetch(page: param)
-            return PagedValue(pages: base.pages + [page], params: base.params + [param])
-        }
-        return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: false)
+        return try await fetchPage(
+            key: key, flightKey: flightKey, query: query,
+            baseParams: base.params, param: param, prepend: false
+        )
     }
 
     /// Prepend the page before the first one. No-op if there are no pages yet or no previous cursor.
@@ -268,44 +296,141 @@ public actor QueryClient {
             return (entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>) ?? PagedValue()
         }
 
-        let task = Task<any Sendable, Error> {
-            let page = try await query.fetch(page: param)
-            return PagedValue(pages: [page] + base.pages, params: [param] + base.params)
-        }
-        return try await store(task, key: key, flightKey: flightKey, query: query, recordsFailure: false)
+        return try await fetchPage(
+            key: key, flightKey: flightKey, query: query,
+            baseParams: base.params, param: param, prepend: true
+        )
     }
 
-    /// Await a page task, store its result as the entry's value, and clear the in-flight slot.
+    /// Reload page one and splice it into the list in place, leaving the pages after it alone.
+    ///
+    /// Like ``fetchPage``, the splice happens inside the flight task and reads the entry as it is
+    /// *then*: a page the reader appended by scrolling while this was in flight must not be undone
+    /// by writing back the snapshot this reload started from.
+    private func fetchFirstPage<Q: InfiniteQuery>(
+        key: CacheKey, flightKey: PageFlightKey, query: Q
+    ) async throws -> PagedValue<Q.Page, Q.PageParam> {
+        let param = query.initialPageParam
+        let task = Task<any Sendable, Error> { [self] in
+            let page = try await query.fetch(page: param)
+            return commitFirstPage(page: page, key: key, query: query, param: param)
+        }
+        pageFlights[flightKey] = task
+        do {
+            let value = try await task.value as! PagedValue<Q.Page, Q.PageParam>
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
+            return value
+        } catch {
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
+            // This is the notify-driven load path, so a failure is recorded and surfaced.
+            recordFailure(key, query: query, error: error, staleTime: query.staleTime, gcTime: query.gcTime)
+            notify(key)
+            throw error
+        }
+    }
+
+    private func commitFirstPage<Q: InfiniteQuery>(
+        page: Q.Page, key: CacheKey, query: Q, param: Q.PageParam
+    ) -> PagedValue<Q.Page, Q.PageParam> {
+        let current = entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>
+        var merged = PagedValue(pages: [page], params: [param])
+        if var pages = current?.pages, var params = current?.params,
+           pages.count > 1, params.count == pages.count {
+            pages[0] = page
+            params[0] = param
+            merged = PagedValue(pages: pages, params: params)
+        }
+        merged = query.reconcile(merged)
+        storeValue(merged, key: key, query: query)
+        notify(key)
+        return merged
+    }
+
+    /// Load one page and splice it into the list.
+    ///
+    /// The commit happens *inside* the flight task, so a second caller that joins this task gets
+    /// the same merged list rather than a bare page — and sees it only once it is cached.
+    private func fetchPage<Q: InfiniteQuery>(
+        key: CacheKey, flightKey: PageFlightKey, query: Q,
+        baseParams: [Q.PageParam], param: Q.PageParam, prepend: Bool
+    ) async throws -> PagedValue<Q.Page, Q.PageParam> {
+        let task = Task<any Sendable, Error> { [self] in
+            let page = try await query.fetch(page: param)
+            return commit(
+                page: page, key: key, query: query,
+                baseParams: baseParams, param: param, prepend: prepend
+            )
+        }
+        pageFlights[flightKey] = task
+        do {
+            let value = try await task.value as! PagedValue<Q.Page, Q.PageParam>
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
+            return value
+        } catch {
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
+            // A next/previous-page failure changed nothing cached; the caller surfaces its own error.
+            throw error
+        }
+    }
+
+    /// Splice a freshly loaded page onto whatever is cached **at commit time**.
+    ///
+    /// The page was requested against a snapshot of the list; by the time it lands a revalidation
+    /// may have replaced that list. Writing `snapshot + page` would then throw the fresh pages away.
+    /// So we re-read the entry and only append when the cursor list still matches the one we
+    /// paginated from — otherwise the page belongs to a list that no longer exists and is dropped.
+    private func commit<Q: InfiniteQuery>(
+        page: Q.Page, key: CacheKey, query: Q,
+        baseParams: [Q.PageParam], param: Q.PageParam, prepend: Bool
+    ) -> PagedValue<Q.Page, Q.PageParam> {
+        let current = (entries[key]?.value as? PagedValue<Q.Page, Q.PageParam>) ?? PagedValue()
+        guard current.params == baseParams else { return current }
+
+        let merged = query.reconcile(
+            prepend
+                ? PagedValue(pages: [page] + current.pages, params: [param] + current.params)
+                : PagedValue(pages: current.pages + [page], params: current.params + [param])
+        )
+        storeValue(merged, key: key, query: query)
+        notify(key)
+        return merged
+    }
+
+    /// Await a whole-list task, store its result as the entry's value, and clear the in-flight slot.
     ///
     /// `recordsFailure` is true only for the initial/refetch direction: that's the notify-driven
-    /// `load` path that could storm. A `fetchNextPage`/`fetchPreviousPage` failure is user-triggered
-    /// (a scroll), so it surfaces its error but must not set the entry's `failedAt` — otherwise it
-    /// would wrongly gate the whole-list load behind backoff.
+    /// `load` path that could storm.
     private func store<Q: InfiniteQuery>(
         _ task: Task<any Sendable, Error>, key: CacheKey, flightKey: PageFlightKey, query: Q,
         recordsFailure: Bool
     ) async throws -> PagedValue<Q.Page, Q.PageParam> {
         pageFlights[flightKey] = task
         do {
-            let value = try await task.value
-            pageFlights[flightKey] = nil
-            entries[key] = Entry(
-                query: query, value: value, updatedAt: clock.now, forcedStale: false,
-                failedAt: nil, failureCount: 0, error: nil,
-                staleTime: query.staleTime, gcTime: query.gcTime
-            )
+            let value = try await task.value as! PagedValue<Q.Page, Q.PageParam>
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
+            storeValue(value, key: key, query: query)
             notify(key)
-            return value as! PagedValue<Q.Page, Q.PageParam>
+            return value
         } catch {
-            pageFlights[flightKey] = nil
+            if pageFlights[flightKey] == task { pageFlights[flightKey] = nil }
             if recordsFailure {
                 // Recorded a load failure: cache state changed, so wake observers to surface it.
                 recordFailure(key, query: query, error: error, staleTime: query.staleTime, gcTime: query.gcTime)
                 notify(key)
             }
-            // A next/previous-page failure changed nothing cached; the caller surfaces its own error.
             throw error
         }
+    }
+
+    private func storeValue<Q: InfiniteQuery>(
+        _ value: PagedValue<Q.Page, Q.PageParam>, key: CacheKey, query: Q
+    ) {
+        entries[key] = Entry(
+            query: query, value: value, updatedAt: clock.now, forcedStale: false,
+            failedAt: nil, failureCount: 0, error: nil,
+            staleTime: query.staleTime, gcTime: query.gcTime
+        )
+        scheduleGCIfUnobserved(key)
     }
 
     // MARK: - Observation lifecycle
@@ -326,6 +451,14 @@ public actor QueryClient {
         } else {
             observerCounts[key] = count - 1
         }
+    }
+
+    /// An entry whose fetch lands *after* its last observer left was never scheduled for eviction —
+    /// `release` ran while the entry did not exist yet, and `scheduleGC` bailed out. Called from
+    /// every store so such an entry still gets collected.
+    private func scheduleGCIfUnobserved(_ key: CacheKey) {
+        guard observerCounts[key] == nil, gcTasks[key] == nil else { return }
+        scheduleGC(key)
     }
 
     private func scheduleGC(_ key: CacheKey) {
@@ -386,7 +519,7 @@ public actor QueryClient {
             entry.failedAt = nil
             entry.failureCount = 0
             entry.error = nil
-            entries[key] = entry
+                entries[key] = entry
             notify(key)
         }
     }
@@ -432,4 +565,8 @@ struct CachedValue<Value: Sendable>: Sendable {
     var isStale: Bool
     var failureCount: Int = 0
     var isError: Bool = false
+    /// Someone explicitly invalidated this entry (rather than it merely ageing out). A change
+    /// notification only sends an observer fetching when this — or a missing value, or a retryable
+    /// failure — is true.
+    var forcedStale: Bool = false
 }
