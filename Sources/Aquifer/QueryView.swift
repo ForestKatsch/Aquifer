@@ -11,6 +11,9 @@ import SwiftUI
 /// }
 /// ```
 ///
+/// With a `placeholder`, `content` renders it immediately instead of `loading`, then re-renders with
+/// the real value once it arrives. See ``Fetch`` for the details.
+///
 /// For several queries resolved as one unit, use ``MultiQueryView``.
 public struct QueryView<Q: Query, Content: View, ErrorContent: View, Loading: View>: View {
     private var fetch: Fetch<Q>
@@ -20,11 +23,12 @@ public struct QueryView<Q: Query, Content: View, ErrorContent: View, Loading: Vi
 
     public init(
         _ query: Q,
+        placeholder: Q.Value? = nil,
         @ViewBuilder content: @escaping (Q.Value) -> Content,
         @ViewBuilder error: @escaping (Error) -> ErrorContent,
         @ViewBuilder loading: @escaping () -> Loading
     ) {
-        self.fetch = Fetch(query)
+        self.fetch = Fetch(query, placeholder: placeholder)
         self.content = content
         self.errorContent = error
         self.loading = loading
@@ -45,9 +49,12 @@ public struct QueryView<Q: Query, Content: View, ErrorContent: View, Loading: Vi
 public extension QueryView where Loading == ProgressView<EmptyView, EmptyView> {
     init(
         _ query: Q,
+        placeholder: Q.Value? = nil,
         @ViewBuilder content: @escaping (Q.Value) -> Content,
         @ViewBuilder error: @escaping (Error) -> ErrorContent
     ) {
-        self.init(query, content: content, error: error, loading: { ProgressView() })
+        self.init(
+            query, placeholder: placeholder, content: content, error: error, loading: { ProgressView() }
+        )
     }
 }

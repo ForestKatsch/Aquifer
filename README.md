@@ -59,10 +59,32 @@ struct QueryState<Value: Sendable> {
     var isFetching: Bool
     var isError: Bool       // last attempt failed (value, if any, still shown)
     var failureCount: Int   // consecutive failures since the last success
+    var isPlaceholder: Bool // value is the view's placeholder, not fetched data
 }
 ```
 
 `value != nil && isFetching` is the stale-while-revalidate case: old data on screen, new data loading.
+
+## Placeholder data
+
+Already holding part of the answer — say, the summary from the list row you just tapped? Pass it as
+a `placeholder` and the detail screen renders it immediately while the real query loads.
+
+```swift
+@Fetch(TodoByID(id: summary.id), placeholder: Todo(summary: summary)) private var todo
+
+QueryView(TodoByID(id: summary.id), placeholder: Todo(summary: summary)) { todo in
+    TodoCard(todo)
+} error: { error in
+    ErrorView(error)
+}
+```
+
+While the query has no real value, `value` is the placeholder and `isPlaceholder` is `true`. Real
+data wins as soon as it exists — a cached value is used straight away, and a fetched one replaces the
+placeholder. The placeholder is never written to the cache, so other views of the same query don't
+see it. If the first fetch fails, the placeholder stays on screen with `error`/`isError` set, the
+same as any sticky value.
 
 ## Errors and retries
 

@@ -15,6 +15,14 @@ import SwiftUI
 /// }
 /// ```
 ///
+/// Pass a `placeholder` to show something while the first fetch is in flight — typically the partial
+/// value a list row already had. It's shown only until real data arrives, flagged by
+/// ``QueryState/isPlaceholder``, and never cached:
+///
+/// ```swift
+/// @Fetch(TodoByID(id: summary.id), placeholder: Todo(summary: summary)) private var todo
+/// ```
+///
 /// The `$`-projection of ``Fetch``: imperative actions on the query.
 @MainActor
 public struct FetchActions<Q: Query> {
@@ -36,13 +44,17 @@ public struct Fetch<Q: Query>: @MainActor DynamicProperty {
     @Environment(\.scenePhase) private var scenePhase
     @State private var observer = QueryObserver<Q>()
     private let query: Q
+    private let placeholder: Q.Value?
 
-    public init(_ query: Q) {
+    /// - Parameter placeholder: Shown as `value` (with `isPlaceholder == true`) until the query has
+    ///   a real value. Local to this view; never written to the cache.
+    public init(_ query: Q, placeholder: Q.Value? = nil) {
         self.query = query
+        self.placeholder = placeholder
     }
 
     public var wrappedValue: QueryState<Q.Value> {
-        observer.state
+        observer.state.withPlaceholder(placeholder)
     }
 
     /// Actions on the query, via the `$`-projection: `$todo.refetch()` for pull-to-refresh / Retry.
